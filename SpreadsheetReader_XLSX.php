@@ -87,7 +87,7 @@
 		 */
 		private $Styles = array();
 
-		private $TempDir = 'tmp';
+		private $TempDir = '';
 		private $TempFiles = array();
 
 		private $CurrentRow = false;
