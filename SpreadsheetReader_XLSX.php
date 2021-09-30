@@ -14,13 +14,21 @@
 		const CELL_TYPE_INLINE_STR = 'inlineStr';
 
 		/**
-		 * Number of shared strings that can be reasonably cached, i.e., that aren't read from file but stored in memory.
-		 *	If the total number of shared strings is higher than this, caching is not used.
+		 * Memory used by shared strings that can be reasonably cached, i.e., that aren't read from file but stored in memory.
+		 *	If the total size in bytes of shared strings is higher than this, only the allowed amount of memory will be used.
 		 *	If this value is null, shared strings are cached regardless of amount.
 		 *	With large shared string caches there are huge performance gains, however a lot of memory could be used which
 		 *	can be a problem, especially on shared hosting.
 		 */
-		const SHARED_STRING_CACHE_LIMIT = 50000;
+		const SHARED_STRING_CACHE_LIMIT = 500000;
+
+		/**
+		 * Max row count of shared strings chunk file.
+		 * The lower the number the more chunk files will be created.
+		 * More chunk files means more XMLReader objects created to read them and more memmory used.
+		 * If there is less rows in file we will need to read less lines to find the correct one and that means better performance.
+		 */
+		const SHARED_STRING_CHUNK_SIZE = 500;
 
 		private $Options = array(
 			'TempDir' => '',
@@ -48,15 +56,16 @@
 		 */
 		private $Worksheet = false;
 
-		// Shared strings file
 		/**
-		 * @var string Path to shared strings XML file
+		 * @var array Collection of XML reader objects for the shared strings chunk files
 		 */
-		private $SharedStringsPath = false;
+        private $SharedStringReaders = array();
+
 		/**
-		 * @var XMLReader XML reader object for the shared strings XML file
+		 * @var array Shared strings count
 		 */
-		private $SharedStrings = false;
+		private $SharedStringCount = 0;
+
 		/**
 		 * @var array Shared strings cache, if the number of shared strings is low enough
 		 */
@@ -78,7 +87,7 @@
 		 */
 		private $Styles = array();
 
-		private $TempDir = '';
+		private $TempDir = 'tmp';
 		private $TempFiles = array();
 
 		private $CurrentRow = false;
@@ -94,14 +103,7 @@
 		 */
 		private $Sheets = false;
 
-		private $SharedStringCount = 0;
-		private $SharedStringIndex = 0;
-		private $LastSharedStringValue = null;
-
 		private $RowOpen = false;
-
-		private $SSOpen = false;
-		private $SSForwarded = false;
 
 		private static $BuiltinFormats = array(
 			0 => '',
@@ -228,17 +230,13 @@
 				$this -> WorkbookXML = new SimpleXMLElement($Zip -> getFromName('xl/workbook.xml'));
 			}
 
-			// Extracting the XMLs from the XLSX zip file
-			if ($Zip -> locateName('xl/sharedStrings.xml') !== false)
-			{
-				$this -> SharedStringsPath = $this -> TempDir.'xl'.DIRECTORY_SEPARATOR.'sharedStrings.xml';
-				$Zip -> extractTo($this -> TempDir, 'xl/sharedStrings.xml');
-				$this -> TempFiles[] = $this -> TempDir.'xl'.DIRECTORY_SEPARATOR.'sharedStrings.xml';
+			// Extracting the shared strings from the XLSX zip file
+            if ($Zip -> locateName('xl/sharedStrings.xml', ZipArchive::FL_NOCASE) !== false) {
+                $Zip -> extractTo($this -> TempDir, 'xl/sharedStrings.xml');
+                $this -> TempFiles['sharedStrings'] = $this->TempDir.'xl'.DIRECTORY_SEPARATOR.'sharedStrings.xml';
 
-				if (is_readable($this -> SharedStringsPath))
+				if (is_readable($this -> TempFiles['sharedStrings']))
 				{
-					$this -> SharedStrings = new XMLReader;
-					$this -> SharedStrings -> open($this -> SharedStringsPath);
 					$this -> PrepareSharedStringCache();
 				}
 			}
@@ -250,7 +248,7 @@
 				if ($Zip -> locateName('xl/worksheets/sheet'.$Index.'.xml') !== false)
 				{
 					$Zip -> extractTo($this -> TempDir, 'xl/worksheets/sheet'.$Index.'.xml');
-					$this -> TempFiles[] = $this -> TempDir.'xl'.DIRECTORY_SEPARATOR.'worksheets'.DIRECTORY_SEPARATOR.'sheet'.$Index.'.xml';
+					$this -> TempFiles['sheet' . $Index] = $this -> TempDir.'xl'.DIRECTORY_SEPARATOR.'worksheets'.DIRECTORY_SEPARATOR.'sheet'.$Index.'.xml';
 				}
 			}
 
@@ -341,12 +339,14 @@
 			}
 			unset($this -> WorksheetPath);
 
-			if ($this -> SharedStrings && $this -> SharedStrings instanceof XMLReader)
+			foreach ($this -> SharedStringReaders as $Reader)
 			{
-				$this -> SharedStrings -> close();
-				unset($this -> SharedStrings);
+				if ($Reader -> Handle instanceof XMLReader)
+				{
+					$Reader -> Handle -> close();
+				}
 			}
-			unset($this -> SharedStringsPath);
+			unset($this -> SharedStringReaders);
 
 			if (isset($this -> StylesXML))
 			{
@@ -404,11 +404,9 @@
 				$RealSheetIndex = $SheetIndexes[$Index];
 			}
 
-			$TempWorksheetPath = $this -> TempDir.'xl/worksheets/sheet'.$RealSheetIndex.'.xml';
-
-			if ($RealSheetIndex !== false && is_readable($TempWorksheetPath))
+			if ($RealSheetIndex !== false && isset($this -> TempFiles['sheet' . $RealSheetIndex]) && is_readable($this -> TempFiles['sheet' . $RealSheetIndex]))
 			{
-				$this -> WorksheetPath = $TempWorksheetPath;
+				$this -> WorksheetPath = $this -> TempFiles['sheet' . $RealSheetIndex];
 
 				$this -> rewind();
 				return true;
@@ -418,51 +416,127 @@
 		}
 
 		/**
-		 * Creating shared string cache if the number of shared strings is acceptably low (or there is no limit on the amount
+		 * Creating shared string cache and chunk files
 		 */
 		private function PrepareSharedStringCache()
 		{
-			while ($this -> SharedStrings -> read())
-			{
-				if ($this -> SharedStrings -> name == 'sst')
-				{
-					$this -> SharedStringCount = $this -> SharedStrings -> getAttribute('count');
-					break;
-				}
-			}
+			$SharedStrings = new XMLReader;
+            $SharedStrings -> open($this -> TempFiles['sharedStrings']);
 
-			if (!$this -> SharedStringCount || (self::SHARED_STRING_CACHE_LIMIT < $this -> SharedStringCount && self::SHARED_STRING_CACHE_LIMIT !== null))
-			{
-				return false;
-			}
-
+            $UsedMemory = 0;
 			$CacheIndex = 0;
 			$CacheValue = '';
-			while ($this -> SharedStrings -> read())
+
+			$chunkFile = null;
+            $RowCount = 0;
+			$FileNr = 0;
+
+			while ($SharedStrings -> read())
 			{
-				switch ($this -> SharedStrings -> name)
+                switch ($SharedStrings -> name)
 				{
+					case 'sst':
+						$this -> SharedStringCount = $SharedStrings -> getAttribute('uniqueCount');
+						break;
 					case 'si':
-						if ($this -> SharedStrings -> nodeType == XMLReader::END_ELEMENT)
+						if ($SharedStrings -> nodeType == XMLReader::END_ELEMENT)
 						{
-							$this -> SharedStringCache[$CacheIndex] = $CacheValue;
+                            if(! is_null(self::SHARED_STRING_CACHE_LIMIT))
+                            {
+								if($UsedMemory < self::SHARED_STRING_CACHE_LIMIT)
+								{
+									$ValueSize = mb_strlen($CacheValue, '8bit');
+
+									if ($UsedMemory + $ValueSize <= self::SHARED_STRING_CACHE_LIMIT)
+									{
+										$UsedMemory += $ValueSize;
+										$this -> SharedStringCache[$CacheIndex] = $CacheValue;
+									}
+								}
+                            }
+							else
+							{
+								$this -> SharedStringCache[$CacheIndex] = $CacheValue;
+							}
+
 							$CacheIndex++;
 							$CacheValue = '';
 						}
 						break;
 					case 't':
-						if ($this -> SharedStrings -> nodeType == XMLReader::END_ELEMENT)
+						if ($SharedStrings -> nodeType == XMLReader::END_ELEMENT)
 						{
-							continue;
+							break;
 						}
-						$CacheValue .= $this -> SharedStrings -> readString();
+
+						$CacheValue .= $SharedStrings -> readString();
+
+						// If we will cache everything we wont need chunk files
+						if(! is_null(self::SHARED_STRING_CACHE_LIMIT))
+						{
+							if(is_resource($chunkFile))
+							{
+								if($RowCount < self::SHARED_STRING_CHUNK_SIZE - 1)
+								{
+									$RowCount++;
+								}
+								else
+								{
+									fwrite($chunkFile, '</root>');
+									fclose($chunkFile);
+
+									$FileNr++;
+									$RowCount = 0;
+								}
+							}
+							
+							if(! is_resource($chunkFile))
+							{
+								$this -> TempFiles['strings-chunk-' . $FileNr] = $filename = $this -> TempDir.'xl/strings-chunk-' . $FileNr . '.xml';
+								$chunkFile = fopen($filename, "w");
+								fwrite($chunkFile, '<?xml version="1.0"?><root>');
+							}
+
+							fwrite($chunkFile, '<v>' . $CacheValue . '</v>');
+						}
 						break;
 				}
 			}
 
-			$this -> SharedStrings -> close();
+			if(is_resource($chunkFile))
+			{
+				fwrite($chunkFile, '</root>');
+				fclose($chunkFile);
+			}
+
+			$SharedStrings -> close();
+
 			return true;
 		}
+		
+        private function GetSharedStringReader($Index)
+        {
+            $FileNr = 0;
+
+			while(($FileNr + 1) * self::SHARED_STRING_CHUNK_SIZE <= $Index)
+			{
+				$FileNr++;
+			}
+
+            if(! isset($this -> SharedStringReaders[$FileNr]))
+            {
+                $this -> SharedStringsReaders[$FileNr] = new stdClass();
+                $this -> SharedStringsReaders[$FileNr] -> Path = $this -> TempFiles['strings-chunk-' . $FileNr];
+                $this -> SharedStringsReaders[$FileNr] -> BaseIndex = $FileNr * self::SHARED_STRING_CHUNK_SIZE;
+                $this -> SharedStringsReaders[$FileNr] -> StringIndex = 0;
+                $this -> SharedStringsReaders[$FileNr] -> LastValue = null;
+                $this -> SharedStringsReaders[$FileNr] -> Handle = new XMLReader;
+
+                $this -> SharedStringsReaders[$FileNr] -> Handle -> open($this -> SharedStringsReaders[$FileNr] -> Path);
+            }
+
+            return $FileNr;
+        }
 
 		/**
 		 * Retrieves a shared string value by its index
@@ -473,131 +547,63 @@
 		 */
 		private function GetSharedString($Index)
 		{
-			if ((self::SHARED_STRING_CACHE_LIMIT === null || self::SHARED_STRING_CACHE_LIMIT > 0) && !empty($this -> SharedStringCache))
+			if (isset($this -> SharedStringCache[$Index]))
 			{
-				if (isset($this -> SharedStringCache[$Index]))
-				{
-					return $this -> SharedStringCache[$Index];
-				}
-				else
-				{
-					return '';
-				}
+				return $this -> SharedStringCache[$Index];
 			}
 
-			// If the desired index is before the current, rewind the XML
-			if ($this -> SharedStringIndex > $Index)
-			{
-				$this -> SSOpen = false;
-				$this -> SharedStrings -> close();
-				$this -> SharedStrings -> open($this -> SharedStringsPath);
-				$this -> SharedStringIndex = 0;
-				$this -> LastSharedStringValue = null;
-				$this -> SSForwarded = false;
-			}
-
-			// Finding the unique string count (if not already read)
-			if ($this -> SharedStringIndex == 0 && !$this -> SharedStringCount)
-			{
-				while ($this -> SharedStrings -> read())
-				{
-					if ($this -> SharedStrings -> name == 'sst')
-					{
-						$this -> SharedStringCount = $this -> SharedStrings -> getAttribute('uniqueCount');
-						break;
-					}
-				}
-			}
-
-			// If index of the desired string is larger than possible, don't even bother.
+            // If index of the desired string is larger than possible, don't even bother.
 			if ($this -> SharedStringCount && ($Index >= $this -> SharedStringCount))
 			{
 				return '';
 			}
 
-			// If an index with the same value as the last already fetched is requested
+            $ReaderId = $this -> GetSharedStringReader($Index);
+            $Reader = $this -> SharedStringsReaders[$ReaderId];
+
+            // If an index with the same value as the last already fetched is requested
 			// (any further traversing the tree would get us further away from the node)
-			if (($Index == $this -> SharedStringIndex) && ($this -> LastSharedStringValue !== null))
+			if (($Index == $Reader -> BaseIndex + $Reader -> StringIndex) && ($Reader -> LastValue !== null))
 			{
-				return $this -> LastSharedStringValue;
+				return $Reader -> LastValue;
 			}
 
-			// Find the correct <si> node with the desired index
-			while ($this -> SharedStringIndex <= $Index)
+			// If the desired index is before the current, rewind the XML
+			if ($Reader -> BaseIndex + $Reader -> StringIndex > $Index)
 			{
-				// SSForwarded is set further to avoid double reading in case nodes are skipped.
-				if ($this -> SSForwarded)
-				{
-					$this -> SSForwarded = false;
-				}
-				else
-				{
-					$ReadStatus = $this -> SharedStrings -> read();
-					if (!$ReadStatus)
-					{
-						break;
-					}
-				}
-
-				if ($this -> SharedStrings -> name == 'si')
-				{
-					if ($this -> SharedStrings -> nodeType == XMLReader::END_ELEMENT)
-					{
-						$this -> SSOpen = false;
-						$this -> SharedStringIndex++;
-					}
-					else
-					{
-						$this -> SSOpen = true;
-	
-						if ($this -> SharedStringIndex < $Index)
-						{
-							$this -> SSOpen = false;
-							$this -> SharedStrings -> next('si');
-							$this -> SSForwarded = true;
-							$this -> SharedStringIndex++;
-							continue;
-						}
-						else
-						{
-							break;
-						}
-					}
-				}
+				$Reader -> Handle -> close();
+				$Reader -> Handle -> open($Reader -> Path);
+				$Reader -> StringIndex = 0;
+				$Reader -> LastValue = null;
 			}
 
 			$Value = '';
 
-			// Extract the value from the shared string
-			if ($this -> SSOpen && ($this -> SharedStringIndex == $Index))
+            while ($Reader -> Handle -> read())
 			{
-				while ($this -> SharedStrings -> read())
+				switch ($Reader -> Handle -> name)
 				{
-					switch ($this -> SharedStrings -> name)
-					{
-						case 't':
-							if ($this -> SharedStrings -> nodeType == XMLReader::END_ELEMENT)
+					case 'v':
+						if ($Reader -> Handle -> nodeType == XMLReader::END_ELEMENT)
+						{
+							$Reader -> StringIndex++;
+
+							if($Reader -> BaseIndex + $Reader -> StringIndex > $Index)
 							{
-								continue;
-							}
-							$Value .= $this -> SharedStrings -> readString();
-							break;
-						case 'si':
-							if ($this -> SharedStrings -> nodeType == XMLReader::END_ELEMENT)
-							{
-								$this -> SSOpen = false;
-								$this -> SSForwarded = true;
 								break 2;
 							}
 							break;
-					}
+						}
+
+						if($Reader -> BaseIndex + $Reader -> StringIndex == $Index)
+						{
+							$Value .= $Reader -> Handle -> readString();
+							$Reader -> LastValue = $Value;
+						}
+						break;
 				}
 			}
 
-			if ($Value)
-			{
-				$this -> LastSharedStringValue = $Value;
-			}
 			return $Value;
 		}
 
@@ -1046,7 +1052,7 @@
 							// If it is a closing tag, skip it
 							if ($this -> Worksheet -> nodeType == XMLReader::END_ELEMENT)
 							{
-								continue;
+								break;
 							}
 
 							$StyleId = (int)$this -> Worksheet -> getAttribute('s');
@@ -1080,7 +1086,7 @@
 						case 'is':
 							if ($this -> Worksheet -> nodeType == XMLReader::END_ELEMENT)
 							{
-								continue;
+								break;
 							}
 
 							$Value = $this -> Worksheet -> readString();
